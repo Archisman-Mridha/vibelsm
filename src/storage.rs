@@ -26,12 +26,8 @@ impl StorageState {
 
     pub fn with_flush_notifier(size_limit: usize) -> (Self, Receiver<()>) {
         let (tx, rx) = mpsc::channel();
-        let state = Self {
-            active: Arc::new(Memtable::new(Some(WalWriter))),
-            immutable_queue: VecDeque::new(),
-            size_limit,
-            flush_notifier: Some(tx),
-        };
+        let mut state = Self::new(size_limit);
+        state.flush_notifier = Some(tx);
         (state, rx)
     }
 
@@ -415,30 +411,21 @@ mod tests {
 
     #[test]
     fn freeze_strips_wal_writer_from_old_memtable() {
-        let state = Arc::new(RwLock::new(new_state(5)));
-        {
-            let s = state.read().unwrap();
-            s.put(Bytes::from("ab"), Bytes::from("cde")); // size = 5 >= 5
-        }
-        state.write().unwrap().freeze();
+        let mut state = new_state(5);
+        state.put(Bytes::from("ab"), Bytes::from("cde")); // size = 5 >= 5
+        state.freeze();
 
-        let s = state.read().unwrap();
-        assert!(s.active.has_wal_writer());
-        assert!(!s.immutable_queue.back().unwrap().has_wal_writer());
+        assert!(state.active.has_wal_writer());
+        assert!(!state.immutable_queue.back().unwrap().has_wal_writer());
     }
 
     #[test]
     fn freeze_signals_flush_notifier() {
-        let (state, rx) = StorageState::with_flush_notifier(5);
-        let state = Arc::new(RwLock::new(state));
-        {
-            let s = state.read().unwrap();
-            s.put(Bytes::from("ab"), Bytes::from("cde")); // size = 5
-        }
-        state.write().unwrap().freeze();
+        let (mut state, rx) = StorageState::with_flush_notifier(5);
+        state.put(Bytes::from("ab"), Bytes::from("cde")); // size = 5
+        state.freeze();
 
         assert!(rx.try_recv().is_ok());
-        // No duplicate notification
         assert!(rx.try_recv().is_err());
     }
 
