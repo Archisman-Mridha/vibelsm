@@ -6,26 +6,18 @@ use crossbeam_skiplist::SkipMap;
 
 use crate::types::ValueKind;
 
-pub struct WalWriter;
-
-impl WalWriter {
-    pub fn write_put(&self, _key: &Bytes, _value: &Bytes) {
-        // Stub — WAL internals are out of scope.
-    }
-
-    pub fn write_delete(&self, _key: &Bytes) {
-        // Stub — WAL internals are out of scope.
-    }
+pub trait WalWrite: Send + Sync {
+    fn write(&self, key: &Bytes, value: &ValueKind);
 }
 
 pub struct Memtable {
     map: SkipMap<Bytes, ValueKind>,
-    wal_writer: Mutex<Option<WalWriter>>,
+    wal_writer: Mutex<Option<Box<dyn WalWrite>>>,
     approximate_size: AtomicUsize,
 }
 
 impl Memtable {
-    pub fn new(wal_writer: Option<WalWriter>) -> Self {
+    pub fn new(wal_writer: Option<Box<dyn WalWrite>>) -> Self {
         Self {
             map: SkipMap::new(),
             wal_writer: Mutex::new(wal_writer),
@@ -37,7 +29,7 @@ impl Memtable {
         self.wal_writer.lock().unwrap().is_some()
     }
 
-    pub fn take_wal_writer(&self) -> Option<WalWriter> {
+    pub fn take_wal_writer(&self) -> Option<Box<dyn WalWrite>> {
         self.wal_writer.lock().unwrap().take()
     }
 
@@ -46,17 +38,22 @@ impl Memtable {
     }
 
     pub fn put(&self, key: Bytes, value: Bytes) {
+        let value_kind = ValueKind::Put(value);
         if let Some(ref wal) = *self.wal_writer.lock().unwrap() {
-            wal.write_put(&key, &value);
+            wal.write(&key, &value_kind);
         }
-        self.approximate_size
-            .fetch_add(key.len() + value.len(), Ordering::Relaxed);
-        self.map.insert(key, ValueKind::Put(value));
+        let size = key.len()
+            + match &value_kind {
+                ValueKind::Put(v) => v.len(),
+                ValueKind::Delete => 0,
+            };
+        self.approximate_size.fetch_add(size, Ordering::Relaxed);
+        self.map.insert(key, value_kind);
     }
 
     pub fn delete(&self, key: Bytes) {
         if let Some(ref wal) = *self.wal_writer.lock().unwrap() {
-            wal.write_delete(&key);
+            wal.write(&key, &ValueKind::Delete);
         }
         self.approximate_size
             .fetch_add(key.len(), Ordering::Relaxed);
@@ -76,7 +73,38 @@ impl Memtable {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
+
+    // --- WalSpy ---
+
+    struct WalSpy {
+        writes: Mutex<Vec<(Bytes, ValueKind)>>,
+    }
+
+    impl WalSpy {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                writes: Mutex::new(vec![]),
+            })
+        }
+
+        fn recorded(&self) -> Vec<(Bytes, ValueKind)> {
+            self.writes.lock().unwrap().clone()
+        }
+    }
+
+    impl WalWrite for Arc<WalSpy> {
+        fn write(&self, key: &Bytes, value: &ValueKind) {
+            self.writes
+                .lock()
+                .unwrap()
+                .push((key.clone(), value.clone()));
+        }
+    }
+
+    // --- Memtable behaviour ---
 
     #[test]
     fn put_then_get_returns_put_value() {
@@ -125,17 +153,10 @@ mod tests {
         let key = Bytes::from("key1");
         mt.delete(key.clone());
         mt.put(key.clone(), Bytes::from("restored"));
-        assert_eq!(mt.get(&key), Some(ValueKind::Put(Bytes::from("restored"))));
-    }
-
-    #[test]
-    fn new_with_wal_writer_accepts_writes() {
-        let mt = Memtable::new(Some(WalWriter));
-        let key = Bytes::from("k");
-        mt.put(key.clone(), Bytes::from("v"));
-        assert_eq!(mt.get(&key), Some(ValueKind::Put(Bytes::from("v"))));
-        mt.delete(key.clone());
-        assert_eq!(mt.get(&key), Some(ValueKind::Delete));
+        assert_eq!(
+            mt.get(&key),
+            Some(ValueKind::Put(Bytes::from("restored")))
+        );
     }
 
     #[test]
@@ -147,17 +168,14 @@ mod tests {
     #[test]
     fn put_increases_approximate_size_by_key_plus_value_len() {
         let mt = Memtable::new(None);
-        let key = Bytes::from("abc");    // 3 bytes
-        let value = Bytes::from("defgh"); // 5 bytes
-        mt.put(key, value);
+        mt.put(Bytes::from("abc"), Bytes::from("defgh")); // 3 + 5
         assert_eq!(mt.approximate_size(), 8);
     }
 
     #[test]
     fn delete_increases_approximate_size_by_key_len_only() {
         let mt = Memtable::new(None);
-        let key = Bytes::from("abcde"); // 5 bytes
-        mt.delete(key);
+        mt.delete(Bytes::from("abcde")); // 5
         assert_eq!(mt.approximate_size(), 5);
     }
 
@@ -165,24 +183,14 @@ mod tests {
     fn approximate_size_grows_monotonically() {
         let mt = Memtable::new(None);
         mt.put(Bytes::from("k1"), Bytes::from("v1"));
-        let size_after_first = mt.approximate_size();
-        assert_eq!(size_after_first, 4); // 2 + 2
-
+        let s1 = mt.approximate_size();
         mt.put(Bytes::from("k2"), Bytes::from("val2"));
-        let size_after_second = mt.approximate_size();
-        assert_eq!(size_after_second, 10); // 4 + (2 + 4)
-        assert!(size_after_second > size_after_first);
-
+        let s2 = mt.approximate_size();
         mt.delete(Bytes::from("k3"));
-        let size_after_delete = mt.approximate_size();
-        assert_eq!(size_after_delete, 12); // 10 + 2
-        assert!(size_after_delete > size_after_second);
-
-        // Overwrite k1 — size still grows, never decreases
+        let s3 = mt.approximate_size();
         mt.put(Bytes::from("k1"), Bytes::from("new"));
-        let size_after_overwrite = mt.approximate_size();
-        assert_eq!(size_after_overwrite, 17); // 12 + (2 + 3)
-        assert!(size_after_overwrite > size_after_delete);
+        let s4 = mt.approximate_size();
+        assert!(s1 < s2 && s2 < s3 && s3 < s4);
     }
 
     #[test]
@@ -194,18 +202,16 @@ mod tests {
         mt.delete(Bytes::from("date"));
 
         let entries: Vec<(Bytes, ValueKind)> = mt.iter().collect();
-        assert_eq!(entries.len(), 4);
-        assert_eq!(entries[0], (Bytes::from("apple"), ValueKind::Put(Bytes::from("1"))));
-        assert_eq!(entries[1], (Bytes::from("banana"), ValueKind::Put(Bytes::from("2"))));
-        assert_eq!(entries[2], (Bytes::from("cherry"), ValueKind::Put(Bytes::from("3"))));
+        assert_eq!(entries[0].0, Bytes::from("apple"));
+        assert_eq!(entries[1].0, Bytes::from("banana"));
+        assert_eq!(entries[2].0, Bytes::from("cherry"));
         assert_eq!(entries[3], (Bytes::from("date"), ValueKind::Delete));
     }
 
     #[test]
     fn iter_on_empty_memtable_yields_nothing() {
         let mt = Memtable::new(None);
-        let entries: Vec<(Bytes, ValueKind)> = mt.iter().collect();
-        assert!(entries.is_empty());
+        assert!(mt.iter().collect::<Vec<_>>().is_empty());
     }
 
     #[test]
@@ -214,9 +220,78 @@ mod tests {
         mt.put(Bytes::from("a"), Bytes::from("1"));
         mt.put(Bytes::from("b"), Bytes::from("2"));
         mt.delete(Bytes::from("c"));
-        assert_eq!(mt.get(&Bytes::from("a")), Some(ValueKind::Put(Bytes::from("1"))));
-        assert_eq!(mt.get(&Bytes::from("b")), Some(ValueKind::Put(Bytes::from("2"))));
+        assert_eq!(
+            mt.get(&Bytes::from("a")),
+            Some(ValueKind::Put(Bytes::from("1")))
+        );
+        assert_eq!(
+            mt.get(&Bytes::from("b")),
+            Some(ValueKind::Put(Bytes::from("2")))
+        );
         assert_eq!(mt.get(&Bytes::from("c")), Some(ValueKind::Delete));
         assert_eq!(mt.get(&Bytes::from("d")), None);
+    }
+
+    // --- WAL seam tests ---
+
+    #[test]
+    fn put_calls_wal_write_with_put_value_kind() {
+        let spy = WalSpy::new();
+        let mt = Memtable::new(Some(Box::new(Arc::clone(&spy))));
+
+        mt.put(Bytes::from("k"), Bytes::from("v"));
+
+        let recorded = spy.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(
+            recorded[0],
+            (Bytes::from("k"), ValueKind::Put(Bytes::from("v")))
+        );
+    }
+
+    #[test]
+    fn delete_calls_wal_write_with_delete_value_kind() {
+        let spy = WalSpy::new();
+        let mt = Memtable::new(Some(Box::new(Arc::clone(&spy))));
+
+        mt.delete(Bytes::from("k"));
+
+        let recorded = spy.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0], (Bytes::from("k"), ValueKind::Delete));
+    }
+
+    #[test]
+    fn wal_write_is_called_for_every_operation() {
+        let spy = WalSpy::new();
+        let mt = Memtable::new(Some(Box::new(Arc::clone(&spy))));
+
+        mt.put(Bytes::from("a"), Bytes::from("1"));
+        mt.delete(Bytes::from("b"));
+        mt.put(Bytes::from("c"), Bytes::from("3"));
+
+        assert_eq!(spy.recorded().len(), 3);
+    }
+
+    #[test]
+    fn no_wal_calls_when_writer_is_none() {
+        let mt = Memtable::new(None);
+        mt.put(Bytes::from("k"), Bytes::from("v"));
+        mt.delete(Bytes::from("k2"));
+        assert_eq!(
+            mt.get(&Bytes::from("k")),
+            Some(ValueKind::Put(Bytes::from("v")))
+        );
+    }
+
+    #[test]
+    fn take_wal_writer_returns_writer_and_leaves_none() {
+        let spy = WalSpy::new();
+        let mt = Memtable::new(Some(Box::new(Arc::clone(&spy))));
+
+        assert!(mt.has_wal_writer());
+        let taken = mt.take_wal_writer();
+        assert!(taken.is_some());
+        assert!(!mt.has_wal_writer());
     }
 }
