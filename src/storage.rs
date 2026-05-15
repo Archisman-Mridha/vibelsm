@@ -251,7 +251,13 @@ mod tests {
 
         {
             let s = state.read().unwrap();
-            s.put(Bytes::from("aaaa"), Bytes::from("bbbbbb")); // size = 10 >= 10
+            s.put(Bytes::from("aaaa"), Bytes::from("bbbb")); // size = 8
+        }
+        assert!(!state.read().unwrap().should_freeze());
+
+        {
+            let s = state.read().unwrap();
+            s.delete(Bytes::from("cc")); // size = 10 >= 10
         }
         if state.read().unwrap().should_freeze() {
             state.write().unwrap().freeze();
