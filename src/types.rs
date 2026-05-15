@@ -1,5 +1,6 @@
 use bytes::Bytes;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueKind {
     Put(Bytes),
     Delete,
