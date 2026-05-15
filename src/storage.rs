@@ -64,13 +64,12 @@ impl StorageState {
     pub fn scan(&self, lower: Bound<Bytes>, upper: Bound<Bytes>) -> Vec<(Bytes, Bytes)> {
         let snapshot: Vec<Arc<Memtable>> = {
             let inner = self.inner.read().unwrap();
-            let mut snap: Vec<Arc<Memtable>> = inner
+            inner
                 .immutable_queue
                 .iter()
                 .cloned()
-                .collect();
-            snap.push(inner.active.clone());
-            snap
+                .chain(std::iter::once(inner.active.clone()))
+                .collect()
         };
 
         let mut merged = BTreeMap::new();
