@@ -1,3 +1,4 @@
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
@@ -19,7 +20,7 @@ impl WalWriter {
 
 pub struct Memtable {
     map: SkipMap<Bytes, ValueKind>,
-    wal_writer: Option<WalWriter>,
+    wal_writer: Mutex<Option<WalWriter>>,
     approximate_size: AtomicUsize,
 }
 
@@ -27,9 +28,17 @@ impl Memtable {
     pub fn new(wal_writer: Option<WalWriter>) -> Self {
         Self {
             map: SkipMap::new(),
-            wal_writer,
+            wal_writer: Mutex::new(wal_writer),
             approximate_size: AtomicUsize::new(0),
         }
+    }
+
+    pub fn has_wal_writer(&self) -> bool {
+        self.wal_writer.lock().unwrap().is_some()
+    }
+
+    pub fn take_wal_writer(&self) -> Option<WalWriter> {
+        self.wal_writer.lock().unwrap().take()
     }
 
     pub fn approximate_size(&self) -> usize {
@@ -37,7 +46,7 @@ impl Memtable {
     }
 
     pub fn put(&self, key: Bytes, value: Bytes) {
-        if let Some(ref wal) = self.wal_writer {
+        if let Some(ref wal) = *self.wal_writer.lock().unwrap() {
             wal.write_put(&key, &value);
         }
         self.approximate_size
@@ -46,7 +55,7 @@ impl Memtable {
     }
 
     pub fn delete(&self, key: Bytes) {
-        if let Some(ref wal) = self.wal_writer {
+        if let Some(ref wal) = *self.wal_writer.lock().unwrap() {
             wal.write_delete(&key);
         }
         self.approximate_size
