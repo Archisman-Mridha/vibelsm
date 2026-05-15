@@ -1,0 +1,16 @@
+{
+  "name": "vibelsm",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@ai-hero/sandcastle": "^0.5.10",
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "scripts": {
+    "sandcastle": "bun run .sandcastle/main.mts"
+  }
+}
