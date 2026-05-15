@@ -40,6 +40,10 @@ _Avoid_: memory usage, size estimate
 A write handle to the WAL file, owned exclusively by the Active Memtable. Every insert writes and flushes a record through the WAL Writer before the entry enters the SkipMap.
 _Avoid_: log writer, WAL handle
 
+**Scan**:
+A point-in-time range read over all Memtables that returns all live Key → value pairs whose Keys fall within the specified bounds. Keys whose latest ValueKind is a Tombstone are silently excluded. The newest ValueKind for each Key takes precedence.
+_Avoid_: range query, range scan, key range
+
 ## Relationships
 
 - A **Memtable** holds zero or more **Key** → **ValueKind** entries
