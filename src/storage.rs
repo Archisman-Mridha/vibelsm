@@ -13,17 +13,12 @@ pub struct StorageState {
 
 impl StorageState {
     pub fn get(&self, key: &Bytes) -> Option<ValueKind> {
-        if let Some(value) = self.active.get(key) {
-            return Some(value);
-        }
-
-        for memtable in self.immutable_queue.iter().rev() {
-            if let Some(value) = memtable.get(key) {
-                return Some(value);
-            }
-        }
-
-        None
+        self.active.get(key).or_else(|| {
+            self.immutable_queue
+                .iter()
+                .rev()
+                .find_map(|memtable| memtable.get(key))
+        })
     }
 }
 
