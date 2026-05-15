@@ -1,15 +1,19 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, RwLock};
 
 use bytes::Bytes;
 
 use crate::memtable::{Memtable, WalWriter};
 use crate::types::ValueKind;
 
+struct Inner {
+    active: Arc<Memtable>,
+    immutable_queue: VecDeque<Arc<Memtable>>,
+}
+
 pub struct StorageState {
-    pub(crate) active: Arc<Memtable>,
-    pub(crate) immutable_queue: VecDeque<Arc<Memtable>>,
+    inner: RwLock<Inner>,
     size_limit: usize,
     flush_notifier: Option<Sender<()>>,
 }
@@ -17,8 +21,10 @@ pub struct StorageState {
 impl StorageState {
     pub fn new(size_limit: usize) -> Self {
         Self {
-            active: Arc::new(Memtable::new(Some(WalWriter))),
-            immutable_queue: VecDeque::new(),
+            inner: RwLock::new(Inner {
+                active: Arc::new(Memtable::new(Some(WalWriter))),
+                immutable_queue: VecDeque::new(),
+            }),
             size_limit,
             flush_notifier: None,
         }
@@ -32,57 +38,76 @@ impl StorageState {
     }
 
     pub fn get(&self, key: &Bytes) -> Option<ValueKind> {
-        self.active.get(key).or_else(|| {
-            self.immutable_queue
+        let inner = self.inner.read().unwrap();
+        inner.active.get(key).or_else(|| {
+            inner
+                .immutable_queue
                 .iter()
                 .rev()
-                .find_map(|memtable| memtable.get(key))
+                .find_map(|m| m.get(key))
         })
     }
 
     pub fn put(&self, key: Bytes, value: Bytes) {
-        self.active.put(key, value);
+        let active = self.inner.read().unwrap().active.clone();
+        active.put(key, value);
+        self.freeze_if_needed(&active);
     }
 
     pub fn delete(&self, key: Bytes) {
-        self.active.delete(key);
+        let active = self.inner.read().unwrap().active.clone();
+        active.delete(key);
+        self.freeze_if_needed(&active);
     }
 
-    pub fn should_freeze(&self) -> bool {
-        self.active.approximate_size() >= self.size_limit
+    pub fn active_approximate_size(&self) -> usize {
+        self.inner.read().unwrap().active.approximate_size()
     }
 
-    pub fn freeze(&mut self) {
-        let old_active = std::mem::replace(
-            &mut self.active,
-            Arc::new(Memtable::new(Some(WalWriter))),
-        );
-        old_active.take_wal_writer();
-        self.immutable_queue.push_back(old_active);
-        if let Some(ref tx) = self.flush_notifier {
-            let _ = tx.send(());
+    pub fn immutable_count(&self) -> usize {
+        self.inner.read().unwrap().immutable_queue.len()
+    }
+
+    fn freeze_if_needed(&self, written_to: &Arc<Memtable>) {
+        if written_to.approximate_size() >= self.size_limit {
+            let mut inner = self.inner.write().unwrap();
+            // Re-check under write lock: another thread may have already frozen this active.
+            if inner.active.approximate_size() >= self.size_limit {
+                let old = std::mem::replace(
+                    &mut inner.active,
+                    Arc::new(Memtable::new(Some(WalWriter))),
+                );
+                old.take_wal_writer();
+                inner.immutable_queue.push_back(old);
+                if let Some(ref tx) = self.flush_notifier {
+                    let _ = tx.send(());
+                }
+            }
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::RwLock;
-
     use super::*;
 
     fn new_memtable() -> Arc<Memtable> {
         Arc::new(Memtable::new(None))
     }
 
+    // Constructs StorageState with specific active + immutable entries for read-path tests.
     fn make_state(active: Arc<Memtable>, immutables: Vec<Arc<Memtable>>) -> StorageState {
         StorageState {
-            active,
-            immutable_queue: VecDeque::from(immutables),
+            inner: RwLock::new(Inner {
+                active,
+                immutable_queue: VecDeque::from(immutables),
+            }),
             size_limit: usize::MAX,
             flush_notifier: None,
         }
     }
+
+    // --- Read-path tests ---
 
     #[test]
     fn get_finds_key_in_active_memtable() {
@@ -147,8 +172,6 @@ mod tests {
         let newer = new_memtable();
         newer.delete(Bytes::from("k1"));
 
-        // immutable_queue is FIFO: older is pushed first, newer second
-        // iter().rev() walks newest first
         let state = make_state(new_memtable(), vec![older, newer]);
 
         assert_eq!(state.get(&Bytes::from("k1")), Some(ValueKind::Delete));
@@ -173,55 +196,28 @@ mod tests {
         middle.put(Bytes::from("k1"), Bytes::from("v_middle"));
 
         let newest = new_memtable();
-        // newest doesn't have k1
+        // newest doesn't have k1 — falls through to middle
 
-        // Queue order: oldest first, newest last (FIFO push order)
         let state = make_state(new_memtable(), vec![oldest, middle, newest]);
 
-        // Should find v_middle (middle is newer than oldest, newest has no k1)
         assert_eq!(
             state.get(&Bytes::from("k1")),
             Some(ValueKind::Put(Bytes::from("v_middle")))
         );
     }
 
-    #[test]
-    fn read_operations_use_shared_lock() {
-        let active = new_memtable();
-        active.put(Bytes::from("k1"), Bytes::from("v1"));
-
-        let state = Arc::new(RwLock::new(make_state(active, vec![])));
-
-        // Two concurrent readers can hold shared locks
-        let read1 = state.read().unwrap();
-        let read2 = state.read().unwrap();
-
-        assert_eq!(
-            read1.get(&Bytes::from("k1")),
-            Some(ValueKind::Put(Bytes::from("v1")))
-        );
-        assert_eq!(
-            read2.get(&Bytes::from("k1")),
-            Some(ValueKind::Put(Bytes::from("v1")))
-        );
-    }
-
-    // --- Freeze write-path tests (issue #6) ---
-
-    fn new_state(size_limit: usize) -> StorageState {
-        StorageState::new(size_limit)
-    }
+    // --- Write + Freeze tests ---
 
     #[test]
-    fn new_creates_state_with_size_limit_and_empty_active() {
-        let state = new_state(1024);
-        assert_eq!(state.active.approximate_size(), 0);
-        assert!(state.immutable_queue.is_empty());
+    fn new_state_has_empty_active_and_no_immutables() {
+        let state = StorageState::new(1024);
+        assert_eq!(state.active_approximate_size(), 0);
+        assert_eq!(state.immutable_count(), 0);
     }
 
     #[test]
     fn put_writes_to_active_memtable() {
-        let state = new_state(1024);
+        let state = StorageState::new(1024);
         state.put(Bytes::from("k1"), Bytes::from("v1"));
         assert_eq!(
             state.get(&Bytes::from("k1")),
@@ -231,199 +227,54 @@ mod tests {
 
     #[test]
     fn delete_writes_to_active_memtable() {
-        let state = new_state(1024);
+        let state = StorageState::new(1024);
         state.delete(Bytes::from("k1"));
         assert_eq!(state.get(&Bytes::from("k1")), Some(ValueKind::Delete));
     }
 
     #[test]
-    fn put_triggers_freeze_when_size_exceeds_limit() {
-        // size_limit = 10; "aaaa" + "bbbb" = 8, then "cc" + "dd" = 4 → total 12 >= 10
-        let state = Arc::new(RwLock::new(new_state(10)));
-
-        {
-            let s = state.read().unwrap();
-            s.put(Bytes::from("aaaa"), Bytes::from("bbbb")); // size = 8
-        }
-        assert!(state.read().unwrap().immutable_queue.is_empty());
-
-        {
-            let s = state.read().unwrap();
-            s.put(Bytes::from("cc"), Bytes::from("dd")); // size = 12 >= 10
-        }
-        if state.read().unwrap().should_freeze() {
-            state.write().unwrap().freeze();
-        }
-
-        let s = state.read().unwrap();
-        assert_eq!(s.immutable_queue.len(), 1);
-        assert_eq!(s.active.approximate_size(), 0);
-    }
-
-    #[test]
-    fn delete_triggers_freeze_when_size_exceeds_limit() {
-        let state = Arc::new(RwLock::new(new_state(10)));
-
-        {
-            let s = state.read().unwrap();
-            s.put(Bytes::from("aaaa"), Bytes::from("bbbb")); // size = 8
-        }
-        assert!(!state.read().unwrap().should_freeze());
-
-        {
-            let s = state.read().unwrap();
-            s.delete(Bytes::from("cc")); // size = 10 >= 10
-        }
-        if state.read().unwrap().should_freeze() {
-            state.write().unwrap().freeze();
-        }
-
-        let s = state.read().unwrap();
-        assert_eq!(s.immutable_queue.len(), 1);
-    }
-
-    #[test]
-    fn triggering_write_lands_in_old_memtable() {
-        let state = Arc::new(RwLock::new(new_state(10)));
-
-        {
-            let s = state.read().unwrap();
-            s.put(Bytes::from("aaaa"), Bytes::from("bbbbbb")); // size = 10, triggers freeze
-        }
-        if state.read().unwrap().should_freeze() {
-            state.write().unwrap().freeze();
-        }
-
-        let s = state.read().unwrap();
-        // The triggering write is in the immutable (old active), not the new active
-        let old = s.immutable_queue.back().unwrap();
-        assert_eq!(
-            old.get(&Bytes::from("aaaa")),
-            Some(ValueKind::Put(Bytes::from("bbbbbb")))
-        );
-        // New active doesn't have the key
-        assert_eq!(s.active.get(&Bytes::from("aaaa")), None);
-    }
-
-    #[test]
-    fn fresh_active_after_freeze_has_zero_size() {
-        let state = Arc::new(RwLock::new(new_state(5)));
-
-        {
-            let s = state.read().unwrap();
-            s.put(Bytes::from("abc"), Bytes::from("de")); // 5 >= 5
-        }
-        if state.read().unwrap().should_freeze() {
-            state.write().unwrap().freeze();
-        }
-
-        assert_eq!(state.read().unwrap().active.approximate_size(), 0);
-    }
-
-    #[test]
-    fn old_active_is_newest_in_immutable_queue() {
-        let state = Arc::new(RwLock::new(new_state(5)));
-
-        // First freeze
-        {
-            let s = state.read().unwrap();
-            s.put(Bytes::from("a"), Bytes::from("1111")); // 5 >= 5
-        }
-        if state.read().unwrap().should_freeze() {
-            state.write().unwrap().freeze();
-        }
-
-        // Second freeze
-        {
-            let s = state.read().unwrap();
-            s.put(Bytes::from("b"), Bytes::from("2222")); // 5 >= 5
-        }
-        if state.read().unwrap().should_freeze() {
-            state.write().unwrap().freeze();
-        }
-
-        let s = state.read().unwrap();
-        assert_eq!(s.immutable_queue.len(), 2);
-        // newest (most recently frozen) is at the back
-        let newest = s.immutable_queue.back().unwrap();
-        assert_eq!(
-            newest.get(&Bytes::from("b")),
-            Some(ValueKind::Put(Bytes::from("2222")))
-        );
-        let oldest = s.immutable_queue.front().unwrap();
-        assert_eq!(
-            oldest.get(&Bytes::from("a")),
-            Some(ValueKind::Put(Bytes::from("1111")))
-        );
-    }
-
-    #[test]
-    fn get_finds_triggering_write_after_freeze() {
-        let state = Arc::new(RwLock::new(new_state(5)));
-
-        {
-            let s = state.read().unwrap();
-            s.put(Bytes::from("k"), Bytes::from("val1")); // 5 >= 5
-        }
-        if state.read().unwrap().should_freeze() {
-            state.write().unwrap().freeze();
-        }
-
-        // get on the state finds the key through immutable queue
-        assert_eq!(
-            state.read().unwrap().get(&Bytes::from("k")),
-            Some(ValueKind::Put(Bytes::from("val1")))
-        );
-    }
-
-    #[test]
-    fn write_operations_use_shared_lock() {
-        let state = Arc::new(RwLock::new(new_state(1024)));
-
-        // Two concurrent writers can hold shared (read) locks
-        let read1 = state.read().unwrap();
-        let read2 = state.read().unwrap();
-
-        read1.put(Bytes::from("k1"), Bytes::from("v1"));
-        read2.put(Bytes::from("k2"), Bytes::from("v2"));
-
-        drop(read1);
-        drop(read2);
-
-        let s = state.read().unwrap();
-        assert_eq!(
-            s.get(&Bytes::from("k1")),
-            Some(ValueKind::Put(Bytes::from("v1")))
-        );
-        assert_eq!(
-            s.get(&Bytes::from("k2")),
-            Some(ValueKind::Put(Bytes::from("v2")))
-        );
-    }
-
-    #[test]
     fn no_freeze_when_size_below_limit() {
-        let state = new_state(100);
-        state.put(Bytes::from("k"), Bytes::from("v")); // size = 2, well below 100
-        assert!(!state.should_freeze());
-        assert!(state.immutable_queue.is_empty());
+        let state = StorageState::new(100);
+        state.put(Bytes::from("k"), Bytes::from("v")); // 2 bytes, well below 100
+        assert_eq!(state.immutable_count(), 0);
+    }
+
+    #[test]
+    fn put_triggers_freeze_when_size_reaches_limit() {
+        // "aaaa"(4) + "bbbb"(4) = 8; then "cc"(2) + "dd"(2) = 4 → total 12 >= 10
+        let state = StorageState::new(10);
+        state.put(Bytes::from("aaaa"), Bytes::from("bbbb")); // size = 8, no freeze
+        assert_eq!(state.immutable_count(), 0);
+
+        state.put(Bytes::from("cc"), Bytes::from("dd")); // size = 12, triggers freeze
+        assert_eq!(state.immutable_count(), 1);
+        assert_eq!(state.active_approximate_size(), 0);
+    }
+
+    #[test]
+    fn delete_triggers_freeze_when_size_reaches_limit() {
+        let state = StorageState::new(10);
+        state.put(Bytes::from("aaaa"), Bytes::from("bbbb")); // size = 8
+        assert_eq!(state.immutable_count(), 0);
+
+        state.delete(Bytes::from("cc")); // size = 10 >= 10, triggers freeze
+        assert_eq!(state.immutable_count(), 1);
     }
 
     #[test]
     fn freeze_strips_wal_writer_from_old_memtable() {
-        let mut state = new_state(5);
-        state.put(Bytes::from("ab"), Bytes::from("cde")); // size = 5 >= 5
-        state.freeze();
+        let state = StorageState::new(5);
+        state.put(Bytes::from("ab"), Bytes::from("cde")); // size = 5 >= 5, triggers freeze
 
-        assert!(state.active.has_wal_writer());
-        assert!(!state.immutable_queue.back().unwrap().has_wal_writer());
+        let inner = state.inner.read().unwrap();
+        assert!(inner.active.has_wal_writer());
+        assert!(!inner.immutable_queue.back().unwrap().has_wal_writer());
     }
 
     #[test]
     fn freeze_signals_flush_notifier() {
-        let (mut state, rx) = StorageState::with_flush_notifier(5);
-        state.put(Bytes::from("ab"), Bytes::from("cde")); // size = 5
-        state.freeze();
+        let (state, rx) = StorageState::with_flush_notifier(5);
+        state.put(Bytes::from("ab"), Bytes::from("cde")); // size = 5, triggers freeze
 
         assert!(rx.try_recv().is_ok());
         assert!(rx.try_recv().is_err());
@@ -431,22 +282,81 @@ mod tests {
 
     #[test]
     fn freeze_without_notifier_does_not_panic() {
-        let mut state = new_state(5);
-        state.put(Bytes::from("ab"), Bytes::from("cde"));
-        state.freeze(); // should not panic even without notifier
-        assert_eq!(state.immutable_queue.len(), 1);
+        let state = StorageState::new(5);
+        state.put(Bytes::from("ab"), Bytes::from("cde")); // triggers freeze
+        assert_eq!(state.immutable_count(), 1);
     }
 
     #[test]
     fn freeze_at_exact_size_limit() {
-        let state = Arc::new(RwLock::new(new_state(4)));
-        {
-            let s = state.read().unwrap();
-            s.put(Bytes::from("ab"), Bytes::from("cd")); // size = 4, exactly at limit
-        }
-        assert!(state.read().unwrap().should_freeze());
-        state.write().unwrap().freeze();
-        assert_eq!(state.read().unwrap().immutable_queue.len(), 1);
-        assert_eq!(state.read().unwrap().active.approximate_size(), 0);
+        let state = StorageState::new(4);
+        state.put(Bytes::from("ab"), Bytes::from("cd")); // exactly 4 >= 4
+        assert_eq!(state.immutable_count(), 1);
+        assert_eq!(state.active_approximate_size(), 0);
+    }
+
+    #[test]
+    fn triggering_write_is_findable_after_freeze() {
+        let state = StorageState::new(10);
+        state.put(Bytes::from("aaaa"), Bytes::from("bbbbbb")); // 10 >= 10, triggers freeze
+
+        // Triggering write is in the immutable queue; active is empty.
+        assert_eq!(state.active_approximate_size(), 0);
+        assert_eq!(
+            state.get(&Bytes::from("aaaa")),
+            Some(ValueKind::Put(Bytes::from("bbbbbb")))
+        );
+    }
+
+    #[test]
+    fn fresh_active_after_freeze_has_zero_size() {
+        let state = StorageState::new(5);
+        state.put(Bytes::from("abc"), Bytes::from("de")); // 5 >= 5
+        assert_eq!(state.active_approximate_size(), 0);
+    }
+
+    #[test]
+    fn multiple_freezes_accumulate_immutable_queue() {
+        let state = StorageState::new(5);
+        state.put(Bytes::from("a"), Bytes::from("1111")); // 5 >= 5, first freeze
+        assert_eq!(state.immutable_count(), 1);
+
+        state.put(Bytes::from("b"), Bytes::from("2222")); // 5 >= 5, second freeze
+        assert_eq!(state.immutable_count(), 2);
+
+        // Both keys are findable through the immutable queue
+        assert_eq!(
+            state.get(&Bytes::from("a")),
+            Some(ValueKind::Put(Bytes::from("1111")))
+        );
+        assert_eq!(
+            state.get(&Bytes::from("b")),
+            Some(ValueKind::Put(Bytes::from("2222")))
+        );
+    }
+
+    #[test]
+    fn concurrent_puts_on_shared_state_both_land() {
+        use std::thread;
+
+        let state = Arc::new(StorageState::new(1024));
+
+        let s1 = Arc::clone(&state);
+        let t1 = thread::spawn(move || s1.put(Bytes::from("k1"), Bytes::from("v1")));
+
+        let s2 = Arc::clone(&state);
+        let t2 = thread::spawn(move || s2.put(Bytes::from("k2"), Bytes::from("v2")));
+
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        assert_eq!(
+            state.get(&Bytes::from("k1")),
+            Some(ValueKind::Put(Bytes::from("v1")))
+        );
+        assert_eq!(
+            state.get(&Bytes::from("k2")),
+            Some(ValueKind::Put(Bytes::from("v2")))
+        );
     }
 }
