@@ -34,10 +34,6 @@ impl Memtable {
         }
     }
 
-    pub fn has_wal_writer(&self) -> bool {
-        self.wal_writer.lock().unwrap().is_some()
-    }
-
     /// Transfers ownership of the WAL Writer out of this Memtable. Called on Freeze to strip
     /// the writer from the old Active Memtable before it becomes Immutable.
     pub fn take_wal_writer(&self) -> Option<Box<dyn WalWrite>> {
@@ -409,9 +405,7 @@ mod tests {
         let spy = WalSpy::new();
         let mt = Memtable::new(Some(Box::new(Arc::clone(&spy))));
 
-        assert!(mt.has_wal_writer());
-        let taken = mt.take_wal_writer();
-        assert!(taken.is_some());
-        assert!(!mt.has_wal_writer());
+        assert!(mt.take_wal_writer().is_some()); // writer was present
+        assert!(mt.take_wal_writer().is_none());  // writer was consumed
     }
 }

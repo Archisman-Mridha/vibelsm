@@ -306,13 +306,38 @@ mod tests {
 
     #[test]
     fn freeze_strips_wal_writer_from_old_memtable() {
-        // WAL not yet wired — both active and immutable have no writer.
-        // Verifies take_wal_writer() is called on freeze, leaving the immutable without a writer.
-        let state = StorageState::new(5);
-        state.put(Bytes::from("ab"), Bytes::from("cde")); // size = 5 >= 5, triggers freeze
-        let inner = state.inner.read().unwrap();
-        assert!(!inner.active.has_wal_writer());
-        assert!(!inner.immutable_queue.back().unwrap().has_wal_writer());
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::memtable::WalWrite;
+
+        // Spy that counts WAL write calls.
+        struct CountingWal(AtomicUsize);
+        impl WalWrite for Arc<CountingWal> {
+            fn write(&self, _: &Bytes, _: &ValueKind) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let wal = Arc::new(CountingWal(AtomicUsize::new(0)));
+        let active = Arc::new(Memtable::new(Some(Box::new(Arc::clone(&wal)))));
+        let state = StorageState {
+            inner: RwLock::new(Inner {
+                active,
+                immutable_queue: VecDeque::new(),
+            }),
+            size_limit: 5,
+            flush_notifier: None,
+        };
+
+        // This write goes through the WAL Writer and triggers Freeze.
+        state.put(Bytes::from("ab"), Bytes::from("cde"));
+        assert_eq!(wal.0.load(Ordering::Relaxed), 1);
+
+        // The frozen Memtable is now in the immutable queue. Write to it directly —
+        // the WAL Writer was stripped on Freeze so the count must not increase.
+        let frozen = state.inner.read().unwrap()
+            .immutable_queue.back().unwrap().clone();
+        frozen.put(Bytes::from("x"), Bytes::from("y"));
+        assert_eq!(wal.0.load(Ordering::Relaxed), 1);
     }
 
     #[test]
