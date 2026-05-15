@@ -44,6 +44,30 @@ _Avoid_: log writer, WAL handle
 A point-in-time range read over all Memtables that returns all live Key → value pairs whose Keys fall within the specified bounds. Keys whose latest ValueKind is a Tombstone are silently excluded. The newest ValueKind for each Key takes precedence.
 _Avoid_: range query, range scan, key range
 
+**SSTable** (Sorted String Table):
+An immutable, sorted on-disk file produced by flushing an Immutable Memtable. Contains Data Blocks, an Index Block, and a Footer.
+_Avoid_: segment file, sorted file, on-disk table
+
+**Data Block**:
+A fixed-size (configurable, default 4 KB) chunk of sorted Key → ValueKind records within an SSTable. The last Data Block is zero-padded to the full block size. Records never straddle Data Block boundaries.
+_Avoid_: block, page, chunk
+
+**Index Block**:
+A variable-length structure at the end of an SSTable, after all Data Blocks, containing one entry per Data Block. Each entry maps the first Key of a Data Block to that block's byte offset in the file. Used to binary-search for the relevant Data Block during a point lookup.
+_Avoid_: sparse index, block index, key index
+
+**Footer**:
+A fixed 28-byte structure at the very end of an SSTable file. Contains the Index Block offset (`u64`), Index Block size (`u64`), Data Block size (`u32`), and a magic number (`u64`). A reader always reads the Footer first to locate the Index Block.
+_Avoid_: trailer, file header
+
+**Flush**:
+The act of writing an Immutable Memtable to disk as a new SSTable. Produces a file named `<id>.sst` in the configured data directory.
+_Avoid_: persist, compact, drain
+
+**SSTable ID**:
+A monotonically incrementing `u32` assigned to each SSTable at Flush time. Determines the filename: zero-padded to 6 digits with a `.sst` extension (e.g. `000001.sst`).
+_Avoid_: file number, sequence number
+
 ## Relationships
 
 - A **Memtable** holds zero or more **Key** → **ValueKind** entries
@@ -52,6 +76,10 @@ _Avoid_: range query, range scan, key range
 - **Approximate Size** is tracked per **Memtable** and drives the **Freeze** decision
 - **Immutable Memtables** are held in a FIFO queue and flushed to disk in order
 - Only the **Active Memtable** holds a **WAL Writer**; **Immutable Memtables** do not
+- A **Flush** converts one **Immutable Memtable** into one **SSTable**
+- An **SSTable** contains one or more **Data Blocks**, one **Index Block**, and one **Footer**
+- The **Index Block** has one entry per **Data Block**, in the same lexicographic key order
+- Each **SSTable** is identified by a unique **SSTable ID** and named `<id>.sst`
 
 ## Example dialogue
 
