@@ -85,13 +85,6 @@ impl Memtable {
             .map(|entry| (entry.key().clone(), entry.value().clone()))
     }
 
-    /// Yields all entries in lexicographic Key order. The SkipMap guarantees this natively;
-    /// no sorting is needed. Used by the flush path to write SSTable entries in sorted order.
-    pub fn iter(&self) -> impl Iterator<Item = (Bytes, ValueKind)> + '_ {
-        self.map
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
-    }
 }
 
 #[cfg(test)]
@@ -219,14 +212,14 @@ mod tests {
     }
 
     #[test]
-    fn iter_yields_entries_in_lexicographic_key_order() {
+    fn range_all_yields_entries_in_lexicographic_key_order() {
         let mt = Memtable::new(None);
         mt.put(Bytes::from("cherry"), Bytes::from("3"));
         mt.put(Bytes::from("apple"), Bytes::from("1"));
         mt.put(Bytes::from("banana"), Bytes::from("2"));
         mt.delete(Bytes::from("date"));
 
-        let entries: Vec<(Bytes, ValueKind)> = mt.iter().collect();
+        let entries: Vec<(Bytes, ValueKind)> = mt.range(..).collect();
         assert_eq!(entries[0].0, Bytes::from("apple"));
         assert_eq!(entries[1].0, Bytes::from("banana"));
         assert_eq!(entries[2].0, Bytes::from("cherry"));
@@ -234,9 +227,9 @@ mod tests {
     }
 
     #[test]
-    fn iter_on_empty_memtable_yields_nothing() {
+    fn range_all_on_empty_memtable_yields_nothing() {
         let mt = Memtable::new(None);
-        assert!(mt.iter().collect::<Vec<_>>().is_empty());
+        assert!(mt.range(..).collect::<Vec<_>>().is_empty());
     }
 
     #[test]
