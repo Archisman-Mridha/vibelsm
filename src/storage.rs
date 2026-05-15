@@ -1,4 +1,5 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
+use std::ops::Bound;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, RwLock};
 
@@ -60,6 +61,34 @@ impl StorageState {
         })
     }
 
+    pub fn scan(&self, lower: Bound<Bytes>, upper: Bound<Bytes>) -> Vec<(Bytes, Bytes)> {
+        let snapshot: Vec<Arc<Memtable>> = {
+            let inner = self.inner.read().unwrap();
+            let mut snap: Vec<Arc<Memtable>> = inner
+                .immutable_queue
+                .iter()
+                .cloned()
+                .collect();
+            snap.push(inner.active.clone());
+            snap
+        };
+
+        let mut merged = BTreeMap::new();
+        for memtable in &snapshot {
+            for (key, value_kind) in memtable.range((lower.clone(), upper.clone())) {
+                merged.insert(key, value_kind);
+            }
+        }
+
+        merged
+            .into_iter()
+            .filter_map(|(key, vk)| match vk {
+                ValueKind::Put(value) => Some((key, value)),
+                ValueKind::Delete => None,
+            })
+            .collect()
+    }
+
     pub fn put(&self, key: Bytes, value: Bytes) {
         // Clone the Arc under the read lock, then release it. The SkipMap inside Memtable is
         // lock-free, so no lock needs to be held for the actual write.
@@ -110,6 +139,7 @@ impl StorageState {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Bound;
     use super::*;
 
     fn new_memtable() -> Arc<Memtable> {
@@ -328,6 +358,142 @@ mod tests {
             state.get(&Bytes::from("b")),
             Some(ValueKind::Put(Bytes::from("2222")))
         );
+    }
+
+    // --- Scan tests ---
+
+    #[test]
+    fn scan_returns_live_keys_from_active_memtable() {
+        let active = new_memtable();
+        active.put(Bytes::from("a"), Bytes::from("1"));
+        active.put(Bytes::from("b"), Bytes::from("2"));
+        active.put(Bytes::from("c"), Bytes::from("3"));
+        let state = make_state(active, vec![]);
+
+        let result = state.scan(Bound::Included(Bytes::from("a")), Bound::Included(Bytes::from("c")));
+        assert_eq!(result, vec![
+            (Bytes::from("a"), Bytes::from("1")),
+            (Bytes::from("b"), Bytes::from("2")),
+            (Bytes::from("c"), Bytes::from("3")),
+        ]);
+    }
+
+    #[test]
+    fn scan_falls_through_to_immutable_when_active_has_no_matching_keys() {
+        let imm = new_memtable();
+        imm.put(Bytes::from("a"), Bytes::from("1"));
+        imm.put(Bytes::from("b"), Bytes::from("2"));
+        let state = make_state(new_memtable(), vec![imm]);
+
+        let result = state.scan(Bound::Included(Bytes::from("a")), Bound::Included(Bytes::from("b")));
+        assert_eq!(result, vec![
+            (Bytes::from("a"), Bytes::from("1")),
+            (Bytes::from("b"), Bytes::from("2")),
+        ]);
+    }
+
+    #[test]
+    fn scan_returns_active_value_when_key_exists_in_both() {
+        let imm = new_memtable();
+        imm.put(Bytes::from("k"), Bytes::from("old"));
+        let active = new_memtable();
+        active.put(Bytes::from("k"), Bytes::from("new"));
+        let state = make_state(active, vec![imm]);
+
+        let result = state.scan(Bound::Included(Bytes::from("k")), Bound::Included(Bytes::from("k")));
+        assert_eq!(result, vec![(Bytes::from("k"), Bytes::from("new"))]);
+    }
+
+    #[test]
+    fn scan_excludes_key_tombstoned_in_active() {
+        let imm = new_memtable();
+        imm.put(Bytes::from("a"), Bytes::from("1"));
+        let active = new_memtable();
+        active.delete(Bytes::from("a"));
+        let state = make_state(active, vec![imm]);
+
+        let result = state.scan(Bound::Included(Bytes::from("a")), Bound::Included(Bytes::from("a")));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn scan_excludes_key_tombstoned_in_newer_immutable() {
+        let older = new_memtable();
+        older.put(Bytes::from("a"), Bytes::from("1"));
+        let newer = new_memtable();
+        newer.delete(Bytes::from("a"));
+        let state = make_state(new_memtable(), vec![older, newer]);
+
+        let result = state.scan(Bound::Included(Bytes::from("a")), Bound::Included(Bytes::from("a")));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn scan_result_is_sorted_in_lexicographic_order() {
+        let active = new_memtable();
+        active.put(Bytes::from("cherry"), Bytes::from("3"));
+        active.put(Bytes::from("apple"), Bytes::from("1"));
+        active.put(Bytes::from("banana"), Bytes::from("2"));
+        let state = make_state(active, vec![]);
+
+        let result = state.scan(Bound::Unbounded, Bound::Unbounded);
+        let keys: Vec<Bytes> = result.iter().map(|(k, _)| k.clone()).collect();
+        assert_eq!(keys, vec![Bytes::from("apple"), Bytes::from("banana"), Bytes::from("cherry")]);
+    }
+
+    #[test]
+    fn scan_returns_empty_vec_when_no_live_keys_in_range() {
+        let active = new_memtable();
+        active.put(Bytes::from("a"), Bytes::from("1"));
+        active.put(Bytes::from("z"), Bytes::from("2"));
+        let state = make_state(active, vec![]);
+
+        let result = state.scan(Bound::Included(Bytes::from("m")), Bound::Excluded(Bytes::from("n")));
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn scan_with_unbounded_lower() {
+        let active = new_memtable();
+        active.put(Bytes::from("a"), Bytes::from("1"));
+        active.put(Bytes::from("b"), Bytes::from("2"));
+        active.put(Bytes::from("c"), Bytes::from("3"));
+        let state = make_state(active, vec![]);
+
+        let result = state.scan(Bound::Unbounded, Bound::Included(Bytes::from("b")));
+        assert_eq!(result, vec![
+            (Bytes::from("a"), Bytes::from("1")),
+            (Bytes::from("b"), Bytes::from("2")),
+        ]);
+    }
+
+    #[test]
+    fn scan_with_unbounded_upper() {
+        let active = new_memtable();
+        active.put(Bytes::from("a"), Bytes::from("1"));
+        active.put(Bytes::from("b"), Bytes::from("2"));
+        active.put(Bytes::from("c"), Bytes::from("3"));
+        let state = make_state(active, vec![]);
+
+        let result = state.scan(Bound::Included(Bytes::from("b")), Bound::Unbounded);
+        assert_eq!(result, vec![
+            (Bytes::from("b"), Bytes::from("2")),
+            (Bytes::from("c"), Bytes::from("3")),
+        ]);
+    }
+
+    #[test]
+    fn scan_returns_newest_value_across_multiple_immutables() {
+        let oldest = new_memtable();
+        oldest.put(Bytes::from("k"), Bytes::from("v_oldest"));
+        let middle = new_memtable();
+        middle.put(Bytes::from("k"), Bytes::from("v_middle"));
+        let newest = new_memtable();
+        // newest doesn't have k
+        let state = make_state(new_memtable(), vec![oldest, middle, newest]);
+
+        let result = state.scan(Bound::Included(Bytes::from("k")), Bound::Included(Bytes::from("k")));
+        assert_eq!(result, vec![(Bytes::from("k"), Bytes::from("v_middle"))]);
     }
 
     #[test]
