@@ -17,6 +17,41 @@ struct Inner {
     immutable_queue: VecDeque<Arc<Memtable>>,
 }
 
+// A point-in-time view of all readable Memtable layers, captured under the read lock.
+// Layers are ordered by priority: index 0 is the Active Memtable (highest), followed by
+// Immutable Memtables newest-to-oldest. Both get() and scan() use this ordering so the
+// "Active wins over Immutable, newest Immutable wins over older" rule is defined once.
+struct ReadSnapshot {
+    layers: Vec<Arc<Memtable>>,
+}
+
+impl ReadSnapshot {
+    /// Point lookup: iterate layers in priority order, return the first match.
+    /// A Tombstone is a valid match — callers that need live-only values must filter.
+    fn get(&self, key: &Bytes) -> Option<ValueKind> {
+        self.layers.iter().find_map(|m| m.get(key))
+    }
+
+    /// Range read: merge all layers into a BTreeMap (oldest-to-newest so newer entries
+    /// overwrite stale ones), then collect live entries in sorted key order.
+    fn scan(&self, lower: Bound<Bytes>, upper: Bound<Bytes>) -> Vec<(Bytes, Bytes)> {
+        let mut merged = BTreeMap::new();
+        // Reverse = oldest layer first; later inserts (newer layers) overwrite stale values.
+        for memtable in self.layers.iter().rev() {
+            for (key, value_kind) in memtable.range((lower.clone(), upper.clone())) {
+                merged.insert(key, value_kind);
+            }
+        }
+        merged
+            .into_iter()
+            .filter_map(|(key, vk)| match vk {
+                ValueKind::Put(value) => Some((key, value)),
+                ValueKind::Delete => None,
+            })
+            .collect()
+    }
+}
+
 pub struct StorageState {
     // RwLock lives inside StorageState so put() and delete() can take &self while still
     // acquiring the write lock on Freeze without requiring callers to manage locking.
@@ -47,45 +82,24 @@ impl StorageState {
         (state, rx)
     }
 
-    /// Read path: Active Memtable first, then Immutable queue newest-to-oldest.
-    /// Returns on the first match — a Tombstone (ValueKind::Delete) short-circuits the search
-    /// because or_else / find_map both stop at the first Some(_).
-    pub fn get(&self, key: &Bytes) -> Option<ValueKind> {
+    /// Captures a point-in-time view of all readable layers under the read lock,
+    /// then releases the lock. Freeze operations on the write path are not blocked
+    /// for the duration of any subsequent read.
+    fn snapshot(&self) -> ReadSnapshot {
         let inner = self.inner.read().unwrap();
-        inner.active.get(key).or_else(|| {
-            inner
-                .immutable_queue
-                .iter()
-                .rev()
-                .find_map(|m| m.get(key))
-        })
+        let mut layers = Vec::with_capacity(1 + inner.immutable_queue.len());
+        layers.push(inner.active.clone());
+        // Push immutables newest-to-oldest to match the priority order defined on ReadSnapshot.
+        layers.extend(inner.immutable_queue.iter().rev().cloned());
+        ReadSnapshot { layers }
+    }
+
+    pub fn get(&self, key: &Bytes) -> Option<ValueKind> {
+        self.snapshot().get(key)
     }
 
     pub fn scan(&self, lower: Bound<Bytes>, upper: Bound<Bytes>) -> Vec<(Bytes, Bytes)> {
-        let snapshot: Vec<Arc<Memtable>> = {
-            let inner = self.inner.read().unwrap();
-            inner
-                .immutable_queue
-                .iter()
-                .cloned()
-                .chain(std::iter::once(inner.active.clone()))
-                .collect()
-        };
-
-        let mut merged = BTreeMap::new();
-        for memtable in &snapshot {
-            for (key, value_kind) in memtable.range((lower.clone(), upper.clone())) {
-                merged.insert(key, value_kind);
-            }
-        }
-
-        merged
-            .into_iter()
-            .filter_map(|(key, vk)| match vk {
-                ValueKind::Put(value) => Some((key, value)),
-                ValueKind::Delete => None,
-            })
-            .collect()
+        self.snapshot().scan(lower, upper)
     }
 
     pub fn put(&self, key: Bytes, value: Bytes) {
