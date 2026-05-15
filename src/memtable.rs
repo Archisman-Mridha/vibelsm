@@ -1,3 +1,4 @@
+use std::ops::RangeBounds;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -76,6 +77,12 @@ impl Memtable {
 
     pub fn get(&self, key: &Bytes) -> Option<ValueKind> {
         self.map.get(key).map(|entry| entry.value().clone())
+    }
+
+    pub fn range<'a>(&'a self, range: impl RangeBounds<Bytes> + 'a) -> impl Iterator<Item = (Bytes, ValueKind)> + 'a {
+        self.map
+            .range(range)
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
     }
 
     /// Yields all entries in lexicographic Key order. The SkipMap guarantees this natively;
@@ -300,6 +307,108 @@ mod tests {
             mt.get(&Bytes::from("k")),
             Some(ValueKind::Put(Bytes::from("v")))
         );
+    }
+
+    // --- range() tests ---
+
+    #[test]
+    fn range_returns_only_entries_within_inclusive_bounds() {
+        let mt = Memtable::new(None);
+        mt.put(Bytes::from("a"), Bytes::from("1"));
+        mt.put(Bytes::from("b"), Bytes::from("2"));
+        mt.put(Bytes::from("c"), Bytes::from("3"));
+        mt.put(Bytes::from("d"), Bytes::from("4"));
+
+        let entries: Vec<(Bytes, ValueKind)> = mt.range(Bytes::from("b")..=Bytes::from("c")).collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (Bytes::from("b"), ValueKind::Put(Bytes::from("2"))));
+        assert_eq!(entries[1], (Bytes::from("c"), ValueKind::Put(Bytes::from("3"))));
+    }
+
+    #[test]
+    fn range_with_exclusive_lower_bound_excludes_boundary_key() {
+        use std::ops::Bound;
+        let mt = Memtable::new(None);
+        mt.put(Bytes::from("a"), Bytes::from("1"));
+        mt.put(Bytes::from("b"), Bytes::from("2"));
+        mt.put(Bytes::from("c"), Bytes::from("3"));
+
+        let entries: Vec<(Bytes, ValueKind)> =
+            mt.range((Bound::Excluded(Bytes::from("a")), Bound::Included(Bytes::from("c")))).collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, Bytes::from("b"));
+        assert_eq!(entries[1].0, Bytes::from("c"));
+    }
+
+    #[test]
+    fn range_with_exclusive_upper_bound_excludes_boundary_key() {
+        let mt = Memtable::new(None);
+        mt.put(Bytes::from("a"), Bytes::from("1"));
+        mt.put(Bytes::from("b"), Bytes::from("2"));
+        mt.put(Bytes::from("c"), Bytes::from("3"));
+
+        let entries: Vec<(Bytes, ValueKind)> = mt.range(Bytes::from("a")..Bytes::from("c")).collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, Bytes::from("a"));
+        assert_eq!(entries[1].0, Bytes::from("b"));
+    }
+
+    #[test]
+    fn range_with_unbounded_lower_returns_entries_up_to_upper() {
+        let mt = Memtable::new(None);
+        mt.put(Bytes::from("a"), Bytes::from("1"));
+        mt.put(Bytes::from("b"), Bytes::from("2"));
+        mt.put(Bytes::from("c"), Bytes::from("3"));
+
+        let entries: Vec<(Bytes, ValueKind)> = mt.range(..=Bytes::from("b")).collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, Bytes::from("a"));
+        assert_eq!(entries[1].0, Bytes::from("b"));
+    }
+
+    #[test]
+    fn range_with_unbounded_upper_returns_entries_from_lower() {
+        let mt = Memtable::new(None);
+        mt.put(Bytes::from("a"), Bytes::from("1"));
+        mt.put(Bytes::from("b"), Bytes::from("2"));
+        mt.put(Bytes::from("c"), Bytes::from("3"));
+
+        let entries: Vec<(Bytes, ValueKind)> = mt.range(Bytes::from("b")..).collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, Bytes::from("b"));
+        assert_eq!(entries[1].0, Bytes::from("c"));
+    }
+
+    #[test]
+    fn range_returns_entries_in_lexicographic_key_order() {
+        let mt = Memtable::new(None);
+        mt.put(Bytes::from("cherry"), Bytes::from("3"));
+        mt.put(Bytes::from("apple"), Bytes::from("1"));
+        mt.put(Bytes::from("banana"), Bytes::from("2"));
+        mt.delete(Bytes::from("date"));
+
+        let entries: Vec<(Bytes, ValueKind)> = mt.range(Bytes::from("apple")..=Bytes::from("date")).collect();
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].0, Bytes::from("apple"));
+        assert_eq!(entries[1].0, Bytes::from("banana"));
+        assert_eq!(entries[2].0, Bytes::from("cherry"));
+        assert_eq!(entries[3], (Bytes::from("date"), ValueKind::Delete));
+    }
+
+    #[test]
+    fn range_on_empty_memtable_yields_nothing() {
+        let mt = Memtable::new(None);
+        assert!(mt.range(Bytes::from("a")..Bytes::from("z")).collect::<Vec<_>>().is_empty());
+    }
+
+    #[test]
+    fn range_with_no_matching_keys_yields_nothing() {
+        let mt = Memtable::new(None);
+        mt.put(Bytes::from("a"), Bytes::from("1"));
+        mt.put(Bytes::from("z"), Bytes::from("2"));
+
+        let entries: Vec<(Bytes, ValueKind)> = mt.range(Bytes::from("m")..Bytes::from("n")).collect();
+        assert!(entries.is_empty());
     }
 
     #[test]
