@@ -3,6 +3,8 @@ use bytes::Bytes;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ValueKind {
     Put(Bytes),
+    // Represents a deletion. We never use empty Bytes for this purpose — an empty Put is a valid
+    // user write and must not be conflated with a delete (see CONTEXT.md: Tombstone).
     Delete,
 }
 

@@ -6,13 +6,21 @@ use crossbeam_skiplist::SkipMap;
 
 use crate::types::ValueKind;
 
+/// Seam between the Memtable and the WAL implementation. The real WAL module will provide a
+/// concrete adapter; tests inject a spy. Keeping this a trait prevents Memtable from being
+/// coupled to the WAL's file-I/O internals before that module is built.
 pub trait WalWrite: Send + Sync {
     fn write(&self, key: &Bytes, value: &ValueKind);
 }
 
 pub struct Memtable {
+    // Lock-free ordered map; concurrent reads and writes need no external synchronization.
     map: SkipMap<Bytes, ValueKind>,
+    // Wrapped in a Mutex so take_wal_writer() can mutate through an &self reference —
+    // necessary because Memtable is always shared behind Arc during Freeze.
     wal_writer: Mutex<Option<Box<dyn WalWrite>>>,
+    // Heuristic byte counter used to decide when to Freeze. Relaxed ordering is intentional:
+    // this is not a synchronization point, and the size limit is approximate by design.
     approximate_size: AtomicUsize,
 }
 
@@ -29,6 +37,8 @@ impl Memtable {
         self.wal_writer.lock().unwrap().is_some()
     }
 
+    /// Transfers ownership of the WAL Writer out of this Memtable. Called on Freeze to strip
+    /// the writer from the old Active Memtable before it becomes Immutable.
     pub fn take_wal_writer(&self) -> Option<Box<dyn WalWrite>> {
         self.wal_writer.lock().unwrap().take()
     }
@@ -39,6 +49,8 @@ impl Memtable {
 
     pub fn put(&self, key: Bytes, value: Bytes) {
         let value_kind = ValueKind::Put(value);
+        // WAL write must happen before the SkipMap insert. If the process crashes between
+        // the two, the WAL replay on recovery will re-insert the entry.
         if let Some(ref wal) = *self.wal_writer.lock().unwrap() {
             wal.write(&key, &value_kind);
         }
@@ -52,9 +64,11 @@ impl Memtable {
     }
 
     pub fn delete(&self, key: Bytes) {
+        // WAL write before SkipMap insert — same durability invariant as put().
         if let Some(ref wal) = *self.wal_writer.lock().unwrap() {
             wal.write(&key, &ValueKind::Delete);
         }
+        // Tombstones carry no value bytes; only the key length counts toward Approximate Size.
         self.approximate_size
             .fetch_add(key.len(), Ordering::Relaxed);
         self.map.insert(key, ValueKind::Delete);
@@ -64,6 +78,8 @@ impl Memtable {
         self.map.get(key).map(|entry| entry.value().clone())
     }
 
+    /// Yields all entries in lexicographic Key order. The SkipMap guarantees this natively;
+    /// no sorting is needed. Used by the flush path to write SSTable entries in sorted order.
     pub fn iter(&self) -> impl Iterator<Item = (Bytes, ValueKind)> + '_ {
         self.map
             .iter()
@@ -95,6 +111,8 @@ mod tests {
         }
     }
 
+    // WalWrite is implemented on Arc<WalSpy> so the test can hold a clone of the Arc
+    // to inspect recorded calls after passing the other clone into the Memtable.
     impl WalWrite for Arc<WalSpy> {
         fn write(&self, key: &Bytes, value: &ValueKind) {
             self.writes

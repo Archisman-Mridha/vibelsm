@@ -7,12 +7,18 @@ use bytes::Bytes;
 use crate::memtable::Memtable;
 use crate::types::ValueKind;
 
+// Only the fields that change on Freeze are grouped here. size_limit and flush_notifier are
+// immutable after construction so they live directly on StorageState, outside the lock.
 struct Inner {
     active: Arc<Memtable>,
+    // FIFO: oldest frozen Memtable at the front, most recently frozen at the back.
+    // The read path walks this in reverse (newest-to-oldest) so recent writes shadow older ones.
     immutable_queue: VecDeque<Arc<Memtable>>,
 }
 
 pub struct StorageState {
+    // RwLock lives inside StorageState so put() and delete() can take &self while still
+    // acquiring the write lock on Freeze without requiring callers to manage locking.
     inner: RwLock<Inner>,
     size_limit: usize,
     flush_notifier: Option<Sender<()>>,
@@ -30,6 +36,9 @@ impl StorageState {
         }
     }
 
+    /// Like `new`, but also returns a receiver that fires once each time a Freeze occurs.
+    /// The flush background thread listens on this to know when a new Immutable Memtable
+    /// is ready to be written to disk as an SSTable.
     pub fn with_flush_notifier(size_limit: usize) -> (Self, Receiver<()>) {
         let (tx, rx) = mpsc::channel();
         let mut state = Self::new(size_limit);
@@ -37,6 +46,9 @@ impl StorageState {
         (state, rx)
     }
 
+    /// Read path: Active Memtable first, then Immutable queue newest-to-oldest.
+    /// Returns on the first match — a Tombstone (ValueKind::Delete) short-circuits the search
+    /// because or_else / find_map both stop at the first Some(_).
     pub fn get(&self, key: &Bytes) -> Option<ValueKind> {
         let inner = self.inner.read().unwrap();
         inner.active.get(key).or_else(|| {
@@ -49,6 +61,8 @@ impl StorageState {
     }
 
     pub fn put(&self, key: Bytes, value: Bytes) {
+        // Clone the Arc under the read lock, then release it. The SkipMap inside Memtable is
+        // lock-free, so no lock needs to be held for the actual write.
         let active = self.inner.read().unwrap().active.clone();
         active.put(key, value);
         self.freeze_if_needed(&active);
@@ -71,14 +85,21 @@ impl StorageState {
     fn freeze_if_needed(&self, written_to: &Arc<Memtable>) {
         if written_to.approximate_size() >= self.size_limit {
             let mut inner = self.inner.write().unwrap();
-            // Re-check under write lock: another thread may have already frozen this active.
+            // Re-check under the write lock: two threads can both observe size >= limit, both
+            // reach this point, but only the first one should actually Freeze. By the time the
+            // second thread acquires the write lock, the active will already be a fresh empty
+            // Memtable whose size is below the limit.
             if inner.active.approximate_size() >= self.size_limit {
                 let old = std::mem::replace(
                     &mut inner.active,
                     Arc::new(Memtable::new(None)),
                 );
+                // Strip the WAL Writer from the frozen Memtable — Immutable Memtables must not
+                // hold a writer (CONTEXT.md invariant). The WAL file is finalized separately.
                 let _ = old.take_wal_writer();
                 inner.immutable_queue.push_back(old);
+                // Ignore send errors: if the flush receiver was dropped the Freeze still
+                // completes correctly — data is safe in the Immutable queue.
                 if let Some(ref tx) = self.flush_notifier {
                     let _ = tx.send(());
                 }
