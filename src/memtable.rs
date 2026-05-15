@@ -54,7 +54,7 @@ impl Memtable {
         let size = key.len()
             + match &value_kind {
                 ValueKind::Put(v) => v.len(),
-                ValueKind::Delete => 0,
+                ValueKind::Delete => 0, // unreachable here; mirrors the delete() formula
             };
         self.approximate_size.fetch_add(size, Ordering::Relaxed);
         self.map.insert(key, value_kind);

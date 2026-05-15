@@ -166,7 +166,7 @@ mod tests {
                 active,
                 immutable_queue: VecDeque::from(immutables),
             }),
-            size_limit: usize::MAX,
+            size_limit: usize::MAX, // prevents Freeze from firing during read-path tests
             flush_notifier: None,
         }
     }
